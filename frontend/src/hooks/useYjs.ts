@@ -2,7 +2,6 @@ import { useEffect, useMemo } from "react";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 
-// Yjsドキュメントとプロバイダーを管理するフック
 export function useYjs(roomName: string = "reactflow-room") {
   // YDocをメモ化（再作成を防ぐ）
   const ydoc = useMemo(() => new Y.Doc(), []);
