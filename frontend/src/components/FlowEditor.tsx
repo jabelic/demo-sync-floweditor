@@ -22,7 +22,7 @@ import ReactFlow, {
 import "reactflow/dist/style.css";
 import * as Y from "yjs";
 import { useYjs } from "../hooks/useYjs";
-import { useYMapSnapshot } from "../hooks/useYArraySnapshot";
+import { useYMapSnapshot } from "../hooks/useYMapSnapshot";
 
 // Awareness情報の型定義
 interface AwarenessState {
