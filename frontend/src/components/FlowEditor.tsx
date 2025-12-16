@@ -1,20 +1,29 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import ReactFlow, {
   Node,
   Edge,
   addEdge,
+  applyEdgeChanges,
+  applyNodeChanges,
   Background,
   Controls,
   MiniMap,
   Connection,
-  useNodesState,
-  useEdgesState,
+  EdgeChange,
   MarkerType,
+  NodeChange,
   ReactFlowInstance,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import * as Y from "yjs";
 import { useYjs } from "../hooks/useYjs";
+import { useYArraySnapshot } from "../hooks/useYArraySnapshot";
 
 // Awareness情報の型定義
 interface AwarenessState {
@@ -28,7 +37,13 @@ interface AwarenessState {
   };
 }
 
-// React FlowのノードとエッジをYjsのY.Arrayに同期
+function normalizeById<T extends { id: string }>(input: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of input) map.set(item.id, item);
+  return Array.from(map.values());
+}
+
+// React FlowのノードとエッジはYjsを唯一のソースにする
 export default function FlowEditor() {
   const { ydoc, provider } = useYjs();
 
@@ -36,11 +51,19 @@ export default function FlowEditor() {
   const nodesArray = useMemo(() => ydoc.getArray<Node>("nodes"), [ydoc]);
   const edgesArray = useMemo(() => ydoc.getArray<Edge>("edges"), [ydoc]);
 
-  // React Flowの状態
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const [reactFlowInstance, setReactFlowInstance] =
-    useState<ReactFlowInstance | null>(null);
+  // Yjsの変更を購読して描画へ反映（React stateにミラーしない）
+  const rawNodes = useYArraySnapshot(nodesArray);
+  const rawEdges = useYArraySnapshot(edgesArray);
+  const nodes = useMemo(() => normalizeById(rawNodes), [rawNodes]);
+  const edges = useMemo(() => normalizeById(rawEdges), [rawEdges]);
+
+  // React Flowインスタンス（座標変換に使用）
+  const reactFlowInstanceRef = useRef<ReactFlowInstance | null>(null);
+  const [hasReactFlowInstance, setHasReactFlowInstance] = useState(false);
+
+  // ビューポート変化で他ユーザーのカーソル再計算を促す
+  const [viewportVersion, setViewportVersion] = useState(0);
+  const rafRef = useRef<number | null>(null);
 
   // Awareness状態（他ユーザーの情報）
   const [awarenessStates, setAwarenessStates] = useState<
@@ -64,77 +87,44 @@ export default function FlowEditor() {
     };
   }, []);
 
-  // YjsからReact Flowへの同期
-  useEffect(() => {
-    // 初期状態を設定
-    const initialNodes = nodesArray.toArray();
-    const initialEdges = edgesArray.toArray();
-    setNodes(initialNodes);
-    setEdges(initialEdges);
+  const replaceYArray = useCallback(
+    <T,>(yarray: Y.Array<T>, next: T[]) => {
+      ydoc.transact(() => {
+        yarray.delete(0, yarray.length);
+        yarray.insert(0, next);
+      });
+    },
+    [ydoc]
+  );
 
-    // Yjsの変更を監視
-    const handleNodesChange = () => {
-      const newNodes = nodesArray.toArray();
-      setNodes(newNodes);
-    };
+  const onNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      const nextNodes = applyNodeChanges(changes, nodes);
+      replaceYArray(nodesArray, normalizeById(nextNodes));
+    },
+    [nodes, nodesArray, replaceYArray]
+  );
 
-    const handleEdgesChange = () => {
-      const newEdges = edgesArray.toArray();
-      setEdges(newEdges);
-    };
-
-    nodesArray.observe(handleNodesChange);
-    edgesArray.observe(handleEdgesChange);
-
-    return () => {
-      nodesArray.unobserve(handleNodesChange);
-      edgesArray.unobserve(handleEdgesChange);
-    };
-  }, [nodesArray, edgesArray, setNodes, setEdges]);
-
-  // React FlowからYjsへの同期（ノード変更時）
-  useEffect(() => {
-    // Yjsの配列を更新
-    const yjsNodes = nodesArray.toArray();
-    const nodesEqual =
-      yjsNodes.length === nodes.length &&
-      yjsNodes.every(
-        (node, i) =>
-          node.id === nodes[i]?.id &&
-          node.position.x === nodes[i]?.position.x &&
-          node.position.y === nodes[i]?.position.y
-      );
-
-    if (!nodesEqual) {
-      nodesArray.delete(0, nodesArray.length);
-      nodesArray.insert(0, nodes);
-    }
-  }, [nodes, nodesArray]);
-
-  // React FlowからYjsへの同期（エッジ変更時）
-  useEffect(() => {
-    // Yjsの配列を更新
-    const yjsEdges = edgesArray.toArray();
-    const edgesEqual =
-      yjsEdges.length === edges.length &&
-      yjsEdges.every((edge, i) => edge.id === edges[i]?.id);
-
-    if (!edgesEqual) {
-      edgesArray.delete(0, edgesArray.length);
-      edgesArray.insert(0, edges);
-    }
-  }, [edges, edgesArray]);
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      const nextEdges = applyEdgeChanges(changes, edges);
+      replaceYArray(edgesArray, normalizeById(nextEdges));
+    },
+    [edges, edgesArray, replaceYArray]
+  );
 
   // Awareness機能の設定
   useEffect(() => {
+    // 外部: Yjs Awarenessとwindow mousemoveに同期する
     // 現在のユーザー情報を設定
     provider.awareness.setLocalStateField("user", currentUser);
 
     // マウス移動時にカーソル位置を更新
     const handleMouseMove = (event: MouseEvent) => {
-      if (!reactFlowInstance) return;
+      const instance = reactFlowInstanceRef.current;
+      if (!instance) return;
 
-      const position = reactFlowInstance.screenToFlowPosition({
+      const position = instance.screenToFlowPosition({
         x: event.clientX,
         y: event.clientY,
       });
@@ -164,7 +154,14 @@ export default function FlowEditor() {
       provider.awareness.off("change", handleAwarenessChange);
       provider.awareness.setLocalStateField("cursor", null);
     };
-  }, [provider, reactFlowInstance, currentUser]);
+  }, [provider, currentUser]);
+
+  useEffect(() => {
+    // 外部: requestAnimationFrame を使用しているのでアンマウント時にキャンセルする
+    return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
 
   // エッジ接続時のハンドラー
   const onConnect = useCallback(
@@ -178,9 +175,10 @@ export default function FlowEditor() {
           type: MarkerType.ArrowClosed,
         },
       };
-      setEdges((eds) => addEdge(newEdge, eds));
+      const nextEdges = addEdge(newEdge, edges);
+      replaceYArray(edgesArray, normalizeById(nextEdges));
     },
-    [setEdges]
+    [edges, edgesArray, replaceYArray]
   );
 
   // ノード追加のヘルパー関数
@@ -196,8 +194,21 @@ export default function FlowEditor() {
         label: `Node ${nodes.length + 1}`,
       },
     };
-    setNodes((nds) => [...nds, newNode]);
-  }, [nodes.length, setNodes]);
+    replaceYArray(nodesArray, normalizeById([...nodes, newNode]));
+  }, [nodes, nodesArray, replaceYArray]);
+
+  const onInit = useCallback((instance: ReactFlowInstance) => {
+    reactFlowInstanceRef.current = instance;
+    setHasReactFlowInstance(true);
+  }, []);
+
+  const onMove = useCallback(() => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      setViewportVersion((v) => v + 1);
+    });
+  }, []);
 
   return (
     <div style={{ width: "100%", height: "100%" }}>
@@ -232,9 +243,12 @@ export default function FlowEditor() {
       </div>
       {/* 他ユーザーのカーソルを表示 */}
       {Array.from(awarenessStates.entries()).map(([clientId, state]) => {
-        if (!state.cursor || !reactFlowInstance) return null;
+        void viewportVersion;
+        if (!state.cursor || !hasReactFlowInstance) return null;
+        const instance = reactFlowInstanceRef.current;
+        if (!instance) return null;
 
-        const position = reactFlowInstance.flowToScreenPosition({
+        const position = instance.flowToScreenPosition({
           x: state.cursor.x,
           y: state.cursor.y,
         });
@@ -288,7 +302,8 @@ export default function FlowEditor() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
-        onInit={setReactFlowInstance}
+        onInit={onInit}
+        onMove={onMove}
         fitView
       >
         <Background />
