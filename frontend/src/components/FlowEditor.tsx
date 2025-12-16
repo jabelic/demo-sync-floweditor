@@ -8,7 +8,6 @@ import {
 import ReactFlow, {
   Node,
   Edge,
-  addEdge,
   applyEdgeChanges,
   applyNodeChanges,
   Background,
@@ -23,7 +22,7 @@ import ReactFlow, {
 import "reactflow/dist/style.css";
 import * as Y from "yjs";
 import { useYjs } from "../hooks/useYjs";
-import { useYArraySnapshot } from "../hooks/useYArraySnapshot";
+import { useYMapSnapshot } from "../hooks/useYMapSnapshot";
 
 // Awareness情報の型定義
 interface AwarenessState {
@@ -37,25 +36,62 @@ interface AwarenessState {
   };
 }
 
-function normalizeById<T extends { id: string }>(input: T[]): T[] {
-  const map = new Map<string, T>();
-  for (const item of input) map.set(item.id, item);
-  return Array.from(map.values());
+function syncListToYMap<T extends { id: string }>(
+  ydoc: Y.Doc,
+  ymap: Y.Map<T>,
+  prev: T[],
+  next: T[]
+) {
+  ydoc.transact(() => {
+    const nextIds = new Set(next.map((n) => n.id));
+    for (const id of prev.map((n) => n.id)) {
+      if (!nextIds.has(id)) ymap.delete(id);
+    }
+    for (const item of next) {
+      ymap.set(item.id, item);
+    }
+  });
 }
 
 // React FlowのノードとエッジはYjsを唯一のソースにする
 export default function FlowEditor() {
   const { ydoc, provider } = useYjs();
 
-  // Yjsの共有配列を取得
-  const nodesArray = useMemo(() => ydoc.getArray<Node>("nodes"), [ydoc]);
-  const edgesArray = useMemo(() => ydoc.getArray<Edge>("edges"), [ydoc]);
+  // Yjsの共有マップ（id -> Node/Edge）
+  const nodesById = useMemo(() => ydoc.getMap<Node>("nodesById"), [ydoc]);
+  const edgesById = useMemo(() => ydoc.getMap<Edge>("edgesById"), [ydoc]);
 
   // Yjsの変更を購読して描画へ反映（React stateにミラーしない）
-  const rawNodes = useYArraySnapshot(nodesArray);
-  const rawEdges = useYArraySnapshot(edgesArray);
-  const nodes = useMemo(() => normalizeById(rawNodes), [rawNodes]);
-  const edges = useMemo(() => normalizeById(rawEdges), [rawEdges]);
+  const nodesByIdSnapshot = useYMapSnapshot(nodesById);
+  const edgesByIdSnapshot = useYMapSnapshot(edgesById);
+  const nodes = useMemo(
+    () => Array.from(nodesByIdSnapshot.values()),
+    [nodesByIdSnapshot]
+  );
+  const edges = useMemo(
+    () => Array.from(edgesByIdSnapshot.values()),
+    [edgesByIdSnapshot]
+  );
+
+  useEffect(() => {
+    // 外部: 共有Yjsドキュメント（外部ストア）のスキーマ移行を行う
+    const legacyNodes = ydoc.getArray<Node>("nodes");
+    const legacyEdges = ydoc.getArray<Edge>("edges");
+
+    if (nodesById.size === 0 && legacyNodes.length > 0) {
+      ydoc.transact(() => {
+        for (const node of legacyNodes.toArray()) nodesById.set(node.id, node);
+        legacyNodes.delete(0, legacyNodes.length);
+      });
+    }
+
+    if (edgesById.size === 0 && legacyEdges.length > 0) {
+      ydoc.transact(() => {
+        for (const edge of legacyEdges.toArray()) edgesById.set(edge.id, edge);
+        legacyEdges.delete(0, legacyEdges.length);
+      });
+    }
+  }, [ydoc, nodesById, edgesById]);
 
   // React Flowインスタンス（座標変換に使用）
   const reactFlowInstanceRef = useRef<ReactFlowInstance | null>(null);
@@ -87,30 +123,20 @@ export default function FlowEditor() {
     };
   }, []);
 
-  const replaceYArray = useCallback(
-    <T,>(yarray: Y.Array<T>, next: T[]) => {
-      ydoc.transact(() => {
-        yarray.delete(0, yarray.length);
-        yarray.insert(0, next);
-      });
-    },
-    [ydoc]
-  );
-
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       const nextNodes = applyNodeChanges(changes, nodes);
-      replaceYArray(nodesArray, normalizeById(nextNodes));
+      syncListToYMap(ydoc, nodesById, nodes, nextNodes);
     },
-    [nodes, nodesArray, replaceYArray]
+    [ydoc, nodesById, nodes]
   );
 
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
       const nextEdges = applyEdgeChanges(changes, edges);
-      replaceYArray(edgesArray, normalizeById(nextEdges));
+      syncListToYMap(ydoc, edgesById, edges, nextEdges);
     },
-    [edges, edgesArray, replaceYArray]
+    [ydoc, edgesById, edges]
   );
 
   // Awareness機能の設定
@@ -175,10 +201,12 @@ export default function FlowEditor() {
           type: MarkerType.ArrowClosed,
         },
       };
-      const nextEdges = addEdge(newEdge, edges);
-      replaceYArray(edgesArray, normalizeById(nextEdges));
+      // 追加はid単位で反映する（配列全置換しない）
+      ydoc.transact(() => {
+        edgesById.set(newEdge.id, newEdge);
+      });
     },
-    [edges, edgesArray, replaceYArray]
+    [ydoc, edgesById]
   );
 
   // ノード追加のヘルパー関数
@@ -194,8 +222,10 @@ export default function FlowEditor() {
         label: `Node ${nodes.length + 1}`,
       },
     };
-    replaceYArray(nodesArray, normalizeById([...nodes, newNode]));
-  }, [nodes, nodesArray, replaceYArray]);
+    ydoc.transact(() => {
+      nodesById.set(newNode.id, newNode);
+    });
+  }, [nodes.length, ydoc, nodesById]);
 
   const onInit = useCallback((instance: ReactFlowInstance) => {
     reactFlowInstanceRef.current = instance;
